@@ -11,3 +11,5 @@ code_guardian_*/
 dist/
 build/
 .tox/
+.streamlit/secrets.toml
+.streamlit/secrets.toml.example

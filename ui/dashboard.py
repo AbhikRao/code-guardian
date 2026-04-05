@@ -58,7 +58,7 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ────────────────────────────────────────────────────────────────────
+# ── Header
 st.markdown("""
 <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:4px;">
   <span style="font-size:22px;font-weight:600;color:#111;letter-spacing:-0.5px;">Code Guardian</span>
@@ -67,10 +67,10 @@ st.markdown("""
 <p style="font-size:13px;color:#6b7280;margin:0 0 28px;">Autonomous code review pipeline &mdash; AMD Instinct MI300X &middot; Llama 3.3 70B</p>
 """, unsafe_allow_html=True)
 
-# ── Input ─────────────────────────────────────────────────────────────────────
+# ── Input
 c1, c2, c3 = st.columns([5, 1, 1])
 with c1:
-    repo_input = st.text_input("repo", placeholder="https://github.com/user/repo  or  /local/path/to/repo", label_visibility="collapsed")
+    repo_input = st.text_input("repo", placeholder="https://github.com/user/repo", label_visibility="collapsed")
 with c2:
     if st.button("Load demo", use_container_width=True):
         st.session_state["use_demo"] = True
@@ -78,17 +78,17 @@ with c3:
     run = st.button("Run pipeline", type="primary", use_container_width=True)
 
 if st.session_state.get("use_demo"):
-    repo_input = "/Users/abhik/Downloads/code-guardian-demo"
+    repo_input = "https://github.com/AbhikRao/code-guardian-demo"
 
-# ── Pipeline track ────────────────────────────────────────────────────────────
+# ── Pipeline track
 STEPS = ["SCANNER", "FIXER", "TEST WRITER", "EXECUTOR", "REPORTER"]
 
 def pipeline_html(active, done_set):
     parts = []
     for i, name in enumerate(STEPS):
-        if name in done_set:    dc, lc = "done",   "done"
-        elif name == active:    dc, lc = "active", "active"
-        else:                   dc, lc = "",        ""
+        if name in done_set:  dc, lc = "done",   "done"
+        elif name == active:  dc, lc = "active", "active"
+        else:                 dc, lc = "",        ""
         parts.append(
             '<div class="pipe-step">'
             '<div class="pipe-dot ' + dc + '"></div>'
@@ -102,7 +102,7 @@ def pipeline_html(active, done_set):
 pipeline_ph = st.empty()
 pipeline_ph.markdown(pipeline_html("", set()), unsafe_allow_html=True)
 
-# ── Run pipeline ──────────────────────────────────────────────────────────────
+# ── Run
 if run and repo_input:
     from core.orchestrator import PipelineState
     from agents.scanner     import ScannerAgent
@@ -111,10 +111,10 @@ if run and repo_input:
     from agents.executor    import ExecutorAgent
     from agents.reporter    import ReporterAgent
 
-    log_ph  = st.empty()
-    done_s  = set()
-    cur     = [""]
-    logs    = []
+    log_ph = st.empty()
+    done_s = set()
+    cur    = [""]
+    logs   = []
 
     def upd(stage, msg, level="ok"):
         cur[0] = stage
@@ -162,12 +162,12 @@ if run and repo_input:
     upd("REPORTER", "Complete", "ok")
     pipeline_ph.markdown(pipeline_html("", done_s), unsafe_allow_html=True)
 
-    # ── Status bar ────────────────────────────────────────────────────────────
+    # Status bar
     dot = "green" if state.tests_passed else "red"
     msg = "Pipeline completed — all tests passed" if state.tests_passed else ("Pipeline completed with failures — " + state.failure_cause)
     st.markdown('<div class="status-bar"><div class="status-dot ' + dot + '"></div><span>' + msg + '</span></div>', unsafe_allow_html=True)
 
-    # ── Metrics ───────────────────────────────────────────────────────────────
+    # Metrics
     test_count = sum(c.count("def test_") for c in state.test_files.values())
     pass_cls   = "pass" if state.tests_passed else "fail"
     pass_label = "Pass" if state.tests_passed else "Fail"
@@ -177,42 +177,36 @@ if run and repo_input:
         '<div class="metric-card"><div class="metric-num">' + str(len(state.patched_files)) + '</div><div class="metric-lbl">Files patched</div></div>'
         '<div class="metric-card"><div class="metric-num">' + str(test_count) + '</div><div class="metric-lbl">Tests written</div></div>'
         '<div class="metric-card ' + pass_cls + '"><div class="metric-num">' + pass_label + '</div><div class="metric-lbl">Test result</div></div>'
-        '</div>',
-        unsafe_allow_html=True
-    )
+        '</div>', unsafe_allow_html=True)
 
-    # ── PR link ───────────────────────────────────────────────────────────────
+    # PR link
     if state.pr_url and state.pr_url.startswith("http"):
         st.markdown('<div style="padding:12px 16px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;font-size:13px;color:#15803d;margin-bottom:20px;">Pull request opened &rarr; <a href="' + state.pr_url + '" style="color:#15803d;font-weight:600;">' + state.pr_url + '</a></div>', unsafe_allow_html=True)
 
-    # ── Bug table ─────────────────────────────────────────────────────────────
+    # Bug table
     if state.bug_report:
         st.markdown('<div class="section-title">Bug Report</div>', unsafe_allow_html=True)
-        rows = []
-        for b in state.bug_report:
-            rows.append({"Severity": b.get("severity","").upper(), "File": b.get("file",""), "Line": b.get("line",""), "Issue": b.get("issue","")})
+        rows = [{"Severity": b.get("severity","").upper(), "File": b.get("file",""), "Line": b.get("line",""), "Issue": b.get("issue","")} for b in state.bug_report]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
                      column_config={"Severity": st.column_config.TextColumn(width="small"),
                                     "Line": st.column_config.NumberColumn(width="small"),
                                     "File": st.column_config.TextColumn(width="medium")})
 
-    # ── Patched files ─────────────────────────────────────────────────────────
+    # Patched files
     if state.patched_files:
         st.markdown('<div class="section-title">Patched Files</div>', unsafe_allow_html=True)
         keys = list(state.patched_files.keys())
         for tab, key in zip(st.tabs(keys), keys):
-            with tab:
-                st.code(state.patched_files[key], language="python")
+            with tab: st.code(state.patched_files[key], language="python")
 
-    # ── Generated tests ───────────────────────────────────────────────────────
+    # Generated tests
     if state.test_files:
         st.markdown('<div class="section-title">Generated Tests</div>', unsafe_allow_html=True)
         tkeys = list(state.test_files.keys())
         for tab, key in zip(st.tabs(tkeys), tkeys):
-            with tab:
-                st.code(state.test_files[key], language="python")
+            with tab: st.code(state.test_files[key], language="python")
 
-    # ── Test output ───────────────────────────────────────────────────────────
+    # Test output
     if state.test_output:
         st.markdown('<div class="section-title">Test Output</div>', unsafe_allow_html=True)
         with st.expander("Show full pytest output", expanded=not state.tests_passed):
@@ -221,5 +215,5 @@ if run and repo_input:
     if state.retry_count > 1:
         st.markdown('<div style="padding:10px 14px;background:#fefce8;border:1px solid #fde68a;border-radius:6px;font-size:12px;color:#92400e;font-family:JetBrains Mono,monospace;margin-top:16px;">Pipeline retried ' + str(state.retry_count - 1) + 'x — last failure routed to ' + state.failure_cause + ' handler</div>', unsafe_allow_html=True)
 
-# ── Footer ─────────────────────────────────────────────────────────────────────
+# ── Footer
 st.markdown('<div style="margin-top:60px;padding-top:20px;border-top:1px solid #f0f0f0;display:flex;justify-content:space-between;"><span style="font-size:12px;color:#9ca3af;font-family:JetBrains Mono,monospace;">Code Guardian</span><span style="font-size:12px;color:#d1d5db;">AMD Developer Hackathon 2026</span></div>', unsafe_allow_html=True)
