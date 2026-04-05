@@ -1,0 +1,13 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+output/
+cg_sandbox_*/
+code_guardian_*/
+*.egg-info/
+dist/
+build/
+.tox/
