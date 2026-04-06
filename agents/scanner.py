@@ -5,10 +5,15 @@ Two-phase scan:
   Phase 1: pyflakes static analysis (fast, free, no tokens)
   Phase 2: LLM deep scan on files flagged by pyflakes or risk keywords
 
+Supported file types: .py, .ipynb (Jupyter notebooks extracted to Python)
+
+Large repo protection:
+  Caps at MAX_FILES_PER_RUN to avoid burning daily token budgets.
+  Files are prioritised by risk-keyword density.
+
 Cloning strategy:
   - Local path: read files directly from disk
-  - Remote URL: use GitHub API (PyGithub) — works in cloud environments
-    where git credentials are unavailable
+  - Remote GitHub URL: use PyGithub API (no git credentials needed)
 """
 
 import os
@@ -18,14 +23,17 @@ import subprocess
 from core.llm_client import chat_json
 from core.orchestrator import PipelineState
 
+MAX_FILES_PER_RUN = 15   # prevent token exhaustion on huge repos
+
 RISK_KEYWORDS = [
     "execute(", "eval(", "exec(", "subprocess", "pickle",
     "md5", "sha1", "password", "secret", "token", "sql",
-    "open(", "os.path", "request", "urllib"
+    "open(", "os.path", "request", "urllib", "cursor",
+    "getenv", "hardcode", "inject"
 ]
 
 SYSTEM_PROMPT = """You are a senior Python security and code-quality engineer.
-Analyze the Python file below for bugs, security issues, and anti-patterns.
+Analyze the Python code below for bugs, security issues, and anti-patterns.
 
 Return ONLY a JSON array. Each element must have exactly these keys:
   "file"     - filename (string)
@@ -47,105 +55,145 @@ class ScannerAgent:
             state.error = f"ScannerAgent error: {e}"
         return state
 
+    # ── Path resolution ───────────────────────────────────────────────────────
+
     def _resolve_path(self, state: PipelineState) -> PipelineState:
-        """Use local path directly, or fetch via GitHub API for remote URLs."""
         if state.local_path and os.path.isdir(state.local_path):
             return state
-
-        # Remote GitHub URL — fetch via API (no git credentials needed)
         if "github.com" in state.repo_url:
             state = self._fetch_via_api(state)
         else:
-            # Last resort: try git clone
             import git
             tmp = tempfile.mkdtemp(prefix="code_guardian_")
             git.Repo.clone_from(state.repo_url, tmp, depth=1)
             state.local_path = tmp
-
         return state
 
     def _fetch_via_api(self, state: PipelineState) -> PipelineState:
-        """Download repo files via GitHub API into a temp directory."""
         from github import Github, Auth
-        import base64
-
-        # Parse owner/repo from URL
-        url = state.repo_url.rstrip("/").rstrip(".git")
+        url   = state.repo_url.rstrip("/").rstrip(".git")
         parts = url.split("/")
         owner, repo_name = parts[-2], parts[-1]
-
-        tmp = tempfile.mkdtemp(prefix="code_guardian_")
-
-        # Auth if token available, otherwise anonymous (60 req/hr limit)
-        token = os.getenv("GITHUB_TOKEN") or self._get_streamlit_secret("GITHUB_TOKEN")
-        g = Github(auth=Auth.Token(token)) if token else Github()
-
-        repo = g.get_repo(f"{owner}/{repo_name}")
-        self._fetch_dir(repo, "", tmp)
+        tmp   = tempfile.mkdtemp(prefix="code_guardian_")
+        token = self._get_secret("GITHUB_TOKEN")
+        g     = Github(auth=Auth.Token(token)) if token else Github()
+        repo  = g.get_repo(f"{owner}/{repo_name}")
+        self._fetch_dir(repo, "", tmp, depth=0)
         state.local_path = tmp
         return state
 
-    def _fetch_dir(self, repo, path, local_root):
-        """Recursively fetch Python files from a GitHub repo."""
-        skip = {".git", "__pycache__", "venv", ".venv", "node_modules"}
-        contents = repo.get_contents(path) if path else repo.get_contents("")
+    def _fetch_dir(self, repo, path, local_root, depth=0):
+        if depth > 4:   # don't recurse forever
+            return
+        skip = {".git", "__pycache__", "venv", ".venv", "node_modules",
+                "dist", "build", ".tox", "migrations"}
+        try:
+            contents = repo.get_contents(path) if path else repo.get_contents("")
+        except Exception:
+            return
         for item in contents:
             if item.name in skip:
                 continue
             local_path = os.path.join(local_root, item.path)
             if item.type == "dir":
                 os.makedirs(local_path, exist_ok=True)
-                self._fetch_dir(repo, item.path, local_root)
-            elif item.name.endswith(".py"):
+                self._fetch_dir(repo, item.path, local_root, depth + 1)
+            elif item.name.endswith(".py") or item.name.endswith(".ipynb"):
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                with open(local_path, "w", encoding="utf-8") as f:
-                    f.write(item.decoded_content.decode("utf-8", errors="ignore"))
+                try:
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        f.write(item.decoded_content.decode("utf-8", errors="ignore"))
+                except Exception:
+                    pass
 
-    def _get_streamlit_secret(self, key: str) -> str:
-        try:
-            import streamlit as st
-            return st.secrets.get(key, "")
-        except Exception:
-            return ""
+    def _get_secret(self, key: str) -> str:
+        val = os.getenv(key, "")
+        if not val:
+            try:
+                import streamlit as st
+                val = st.secrets.get(key, "")
+            except Exception:
+                pass
+        return val
 
-    def _collect_python_files(self, root: str) -> list:
-        skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", "dist", "build"}
+    # ── File collection ───────────────────────────────────────────────────────
+
+    def _collect_files(self, root: str) -> list:
+        skip_dirs = {".git", "__pycache__", ".venv", "venv",
+                     "node_modules", "dist", "build", "migrations"}
         result = []
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in skip_dirs]
             for fname in filenames:
-                if fname.endswith(".py"):
+                if fname.endswith(".py") or fname.endswith(".ipynb"):
                     result.append(os.path.join(dirpath, fname))
         return result
 
+    def _extract_source(self, filepath: str) -> str:
+        """Extract Python source — handle both .py and .ipynb."""
+        if filepath.endswith(".ipynb"):
+            try:
+                nb = json.loads(open(filepath, encoding="utf-8", errors="ignore").read())
+                lines = []
+                for cell in nb.get("cells", []):
+                    if cell.get("cell_type") == "code":
+                        src = cell.get("source", [])
+                        if isinstance(src, list):
+                            lines.extend(src)
+                        else:
+                            lines.append(src)
+                return "".join(lines)
+            except Exception:
+                return ""
+        return open(filepath, "r", encoding="utf-8", errors="ignore").read()
+
+    # ── Risk scoring ──────────────────────────────────────────────────────────
+
+    def _risk_score(self, source: str) -> int:
+        src_lower = source.lower()
+        return sum(src_lower.count(kw) for kw in RISK_KEYWORDS)
+
     def _pyflakes_has_issues(self, filepath: str) -> bool:
+        if filepath.endswith(".ipynb"):
+            return True   # always deep-scan notebooks
         result = subprocess.run(
             ["python3", "-m", "pyflakes", filepath],
             capture_output=True, text=True
         )
         return bool(result.stdout.strip() or result.returncode != 0)
 
-    def _has_risk_keywords(self, source: str) -> bool:
-        src_lower = source.lower()
-        return any(kw in src_lower for kw in RISK_KEYWORDS)
+    # ── Main scan ─────────────────────────────────────────────────────────────
 
     def _scan_files(self, state: PipelineState) -> PipelineState:
-        all_bugs = []
-        py_files = self._collect_python_files(state.local_path)
+        all_files = self._collect_files(state.local_path)
 
-        if not py_files:
+        if not all_files:
             state.error = "No Python files found in repository."
             return state
 
-        for filepath in py_files:
+        # Score every file, keep top MAX_FILES_PER_RUN by risk
+        scored = []
+        for filepath in all_files:
+            source = self._extract_source(filepath)
+            if len(source.strip()) < 10:
+                continue
+            score = self._risk_score(source)
+            if score > 0 or self._pyflakes_has_issues(filepath):
+                scored.append((score, filepath, source))
+
+        # Sort descending by risk, cap to limit
+        scored.sort(key=lambda x: x[0], reverse=True)
+        to_scan = scored[:MAX_FILES_PER_RUN]
+
+        all_bugs = []
+        for _, filepath, source in to_scan:
             rel_path = os.path.relpath(filepath, state.local_path)
             try:
-                with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                    source = f.read()
-                if len(source.strip()) < 10:
-                    continue
-                if not (self._pyflakes_has_issues(filepath) or self._has_risk_keywords(source)):
-                    continue
+                # Trim very large files
+                lines = source.splitlines()
+                if len(lines) > 250:
+                    source = "\n".join(lines[:250])
+
                 user_prompt = f"File: {rel_path}\n\n```python\n{source}\n```"
                 raw  = chat_json(SYSTEM_PROMPT, user_prompt)
                 bugs = json.loads(raw)

@@ -1,22 +1,29 @@
 """
 llm_client.py
 ─────────────
-LLM connection with 3-tier fallback:
+LLM connection with 3-tier fallback + automatic rate-limit retry.
+
+Tiers:
   1. AMD Developer Cloud (primary — MI300X)
   2. Groq               (dev/testing)
   3. Ollama local       (offline fallback)
 
-Reads config from environment variables or Streamlit secrets.
+Rate limit handling:
+  On 429 the error message includes "Please try again in Xs".
+  We parse that wait time and sleep before retrying (max 3 retries).
+  This means the pipeline self-heals instead of crashing on rate limits.
 """
 
 import os
-from openai import OpenAI
+import re
+import time
+from openai import OpenAI, RateLimitError
 from dotenv import load_dotenv
 
 load_dotenv()
 
+
 def _get(key: str, default: str = "") -> str:
-    """Read from env, then Streamlit secrets if running in cloud."""
     val = os.getenv(key, "")
     if not val:
         try:
@@ -25,6 +32,7 @@ def _get(key: str, default: str = "") -> str:
         except Exception:
             val = default
     return val
+
 
 AMD_API_KEY    = _get("AMD_API_KEY")
 AMD_BASE_URL   = _get("AMD_BASE_URL",   "https://api.groq.com/openai/v1")
@@ -35,13 +43,16 @@ OLLAMA_MODEL   = "llama3.1:8b"
 _client:   OpenAI | None = None
 _provider: str           = ""
 
+MAX_RETRIES = 3
+
 
 def _ollama_running() -> bool:
     try:
         import subprocess
-        r = subprocess.run(["curl","-s","-o","/dev/null","-w","%{http_code}",
-                            "http://localhost:11434/api/tags"],
-                           capture_output=True, text=True, timeout=3)
+        r = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+             "http://localhost:11434/api/tags"],
+            capture_output=True, text=True, timeout=3)
         return r.stdout.strip() == "200"
     except Exception:
         return False
@@ -73,19 +84,50 @@ def _model() -> str:
     return OLLAMA_MODEL if p == "ollama" else AMD_MODEL_NAME
 
 
+def _parse_retry_seconds(error_msg: str) -> float:
+    """Extract wait time from Groq/AMD rate limit error messages."""
+    # Matches: "Please try again in 9m45.79s" or "try again in 30s"
+    m = re.search(r'try again in (?:(\d+)m)?(\d+(?:\.\d+)?)s', str(error_msg))
+    if m:
+        minutes = float(m.group(1) or 0)
+        seconds = float(m.group(2) or 0)
+        return minutes * 60 + seconds
+    return 60.0  # safe default
+
+
 def chat(system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
     client, _ = get_client()
-    resp = client.chat.completions.create(
-        model=_model(), temperature=temperature,
-        messages=[{"role":"system","content":system_prompt},
-                  {"role":"user","content":user_prompt}],
-    )
-    return resp.choices[0].message.content.strip()
+    last_err = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=_model(), temperature=temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+            )
+            return resp.choices[0].message.content.strip()
+
+        except RateLimitError as e:
+            last_err = e
+            wait = _parse_retry_seconds(str(e))
+            # Cap the wait to 90s so the UI doesn't appear frozen forever
+            wait = min(wait, 90.0)
+            print(f"[LLM] Rate limit hit. Waiting {wait:.0f}s (attempt {attempt}/{MAX_RETRIES})...")
+            time.sleep(wait)
+
+        except Exception as e:
+            raise e
+
+    raise last_err
 
 
 def chat_json(system_prompt: str, user_prompt: str) -> str:
     return chat(
-        system_prompt + "\n\nIMPORTANT: Reply ONLY with valid JSON. No markdown, no extra text.",
+        system_prompt + "\n\nIMPORTANT: Reply ONLY with valid JSON. "
+                        "No markdown fences, no explanation, no extra text.",
         user_prompt, temperature=0.1
     )
 

@@ -1,10 +1,8 @@
 """
-fixer.py
-────────
-Agent 2: Takes the bug report from Scanner and generates
-a fixed version of each affected file.
-
-Output: state.patched_files → { "src/app.py": "<full fixed source>", ... }
+fixer.py — Agent 2
+───────────────────
+Generates patched versions of buggy files.
+One LLM call per file — all bugs for that file sent together.
 """
 
 import os
@@ -15,12 +13,12 @@ from core.orchestrator import PipelineState
 SYSTEM_PROMPT = """You are an expert Python engineer performing a code review fix.
 You will be given:
   1. The original source of a Python file
-  2. A list of bugs found in that file (with line numbers and descriptions)
+  2. A list of bugs found in that file
 
 Your job: Return the COMPLETE fixed Python file.
 Rules:
   - Fix ALL listed bugs. Do not introduce new ones.
-  - Keep all existing logic that is NOT buggy — do not refactor unnecessarily.
+  - Keep all existing logic that is NOT buggy.
   - Add a short inline comment on each fixed line: # FIXED: <reason>
   - Return ONLY the raw Python source code. No markdown fences, no explanation."""
 
@@ -29,31 +27,30 @@ class FixerAgent:
 
     def run(self, state: PipelineState) -> PipelineState:
         try:
-            # Group bugs by file so we send one request per file
             bugs_by_file: dict[str, list] = {}
             for bug in state.bug_report:
-                bugs_by_file.setdefault(bug["file"], []).append(bug)
+                if bug.get("file") and bug["file"] != "test_output":
+                    bugs_by_file.setdefault(bug["file"], []).append(bug)
 
             for rel_path, bugs in bugs_by_file.items():
                 abs_path = os.path.join(state.local_path, rel_path)
                 if not os.path.exists(abs_path):
                     continue
-
                 with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
-                    original_source = f.read()
+                    original = f.read()
 
-                bugs_text = json.dumps(bugs, indent=2)
+                # Trim very large files
+                lines = original.splitlines()
+                if len(lines) > 300:
+                    original = "\n".join(lines[:300])
+
                 user_prompt = (
                     f"File: {rel_path}\n\n"
-                    f"Bugs to fix:\n{bugs_text}\n\n"
-                    f"Original source:\n```python\n{original_source}\n```"
+                    f"Bugs to fix:\n{json.dumps(bugs, indent=2)}\n\n"
+                    f"Original source:\n```python\n{original}\n```"
                 )
-
-                fixed_source = chat(SYSTEM_PROMPT, user_prompt, temperature=0.1)
-
-                # Strip accidental markdown fences if the model added them
-                fixed_source = self._strip_fences(fixed_source)
-                state.patched_files[rel_path] = fixed_source
+                fixed = chat(SYSTEM_PROMPT, user_prompt, temperature=0.1)
+                state.patched_files[rel_path] = self._strip_fences(fixed)
 
         except Exception as e:
             state.error = f"FixerAgent error: {e}"
