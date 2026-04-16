@@ -1,20 +1,28 @@
 """
-executor.py — Agent 4
-──────────────────────
-Runs generated tests in an isolated sandbox with structured
-failure triage to route failures to the correct agent.
+executor.py - Agent 4
+----------------------
+Runs generated tests inside an isolated Docker container.
 
-  - "patch_wrong"  → Fixer retries
-  - "test_wrong"   → TestWriter retries
-  - "environment"  → surfaces immediately, no retry
+SECURITY POLICY:
+  This agent executes AI-generated code. Isolation is non-negotiable.
+  Docker is the ONLY supported execution environment.
 
-Sandbox strategy:
-  - Preferred: Docker container (true isolation)
-  - Fallback:  subprocess using the project venv Python
+  If Docker is unavailable the pipeline halts immediately with a clear
+  error. The subprocess fallback has been permanently removed because
+  executing untrusted AI-generated code directly in the host virtual
+  environment is a critical security vulnerability, particularly on
+  shared cloud infrastructure such as Streamlit Community Cloud.
+
+Docker constraints enforced:
+  --network none          No internet access from inside the container
+  --memory 512m           Memory cap prevents runaway allocations
+  --cpus 1                CPU cap prevents resource exhaustion
+  --read-only             Filesystem is read-only except /tmp tmpfs
+  --no-new-privileges     Prevents privilege escalation inside container
+  python:3.13-slim        Minimal attack surface, throwaway container
 """
 
 import os
-import sys
 import json
 import shutil
 import subprocess
@@ -22,15 +30,11 @@ import tempfile
 from core.llm_client import chat_json
 from core.orchestrator import PipelineState
 
-# Use the same Python interpreter that's running this code
-# so the sandbox has access to all installed packages (pytest, etc.)
-PYTHON_BIN = sys.executable
-
 TRIAGE_PROMPT = """You are a senior QA engineer reading pytest failure output.
 Classify the ROOT CAUSE of the failure.
 
 Return ONLY a JSON object with exactly these keys:
-  "cause": one of "patch_wrong" | "test_wrong" | "environment"
+  "cause":  one of "patch_wrong" | "test_wrong" | "environment"
   "reason": one sentence explaining why
 
   "patch_wrong"   = the fixed code has a bug (assertion on correct behaviour fails)
@@ -38,20 +42,57 @@ Return ONLY a JSON object with exactly these keys:
                     tests something unrelated, would fail even on correct code)
   "environment"   = missing import, missing file, setup error unrelated to logic
 
-No markdown, no extra text — raw JSON only."""
+No markdown, no extra text -- raw JSON only."""
 
 
 class ExecutorAgent:
 
+    def _docker_available(self) -> bool:
+        """Return True only if Docker daemon is running and reachable."""
+        try:
+            result = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                timeout=8
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+
     def run(self, state: PipelineState) -> PipelineState:
+        """
+        Execute tests in an isolated Docker container.
+        Halts pipeline immediately if Docker is not available.
+        No subprocess fallback -- see security policy in module docstring.
+        """
+        if not self._docker_available():
+            state.error = (
+                "SECURITY HALT: Docker is not available on this system.\n\n"
+                "Code Guardian requires Docker to execute AI-generated test code "
+                "in an isolated container. Running untrusted code directly in the "
+                "host environment is a critical security vulnerability and is not "
+                "permitted.\n\n"
+                "To resolve:\n"
+                "  1. Install Docker Desktop: https://docs.docker.com/get-docker/\n"
+                "  2. Start the Docker daemon\n"
+                "  3. Re-run the pipeline\n\n"
+                "Note: Streamlit Community Cloud does not support Docker. "
+                "Run Code Guardian locally or on a Docker-capable host."
+            )
+            return state
+
         try:
             sandbox = self._build_sandbox(state)
-            state   = self._run_pytest(state, sandbox)
+            state   = self._run_in_docker(state, sandbox)
         except Exception as e:
             state.error = f"ExecutorAgent error: {e}"
         return state
 
     def _build_sandbox(self, state: PipelineState) -> str:
+        """
+        Build a temp directory with patched files and generated tests.
+        Mounted read-only into the container -- container cannot write to host.
+        """
         sandbox = tempfile.mkdtemp(prefix="cg_sandbox_")
         shutil.copytree(state.local_path, sandbox, dirs_exist_ok=True)
 
@@ -75,47 +116,35 @@ class ExecutorAgent:
 
         return sandbox
 
-    def _docker_available(self) -> bool:
-        try:
-            result = subprocess.run(["docker", "info"],
-                capture_output=True, timeout=5)
-            return result.returncode == 0
-        except Exception:
-            return False
-
-    def _run_in_docker(self, sandbox: str) -> tuple[str, int]:
-        result = subprocess.run([
-            "docker", "run", "--rm",
-            "--network", "none",
-            "--memory", "512m",
-            "--cpus", "1",
-            "-v", f"{sandbox}:/app",
-            "-w", "/app",
-            "python:3.13-slim",
-            "bash", "-c",
-            "pip install pytest pytest-timeout --quiet 2>/dev/null && "
-            "python -m pytest tests/ -v --tb=short --no-header --timeout=30"
-        ], capture_output=True, text=True, timeout=180)
-        return result.stdout + result.stderr, result.returncode
-
-    def _run_in_subprocess(self, sandbox: str) -> tuple[str, int]:
-        """Use the venv Python so all packages (pytest-timeout etc.) are available."""
+    def _run_in_docker(self, state: PipelineState, sandbox: str) -> PipelineState:
+        """Run pytest inside a throwaway container with strict isolation."""
         result = subprocess.run(
-            [PYTHON_BIN, "-m", "pytest", "tests/", "-v",
-             "--tb=short", "--no-header", "--timeout=30"],
-            capture_output=True, text=True,
-            cwd=sandbox, timeout=120
+            [
+                "docker", "run", "--rm",
+                "--network",          "none",
+                "--memory",           "512m",
+                "--cpus",             "1",
+                "--read-only",
+                "--no-new-privileges",
+                "--tmpfs",            "/tmp",
+                "-v", f"{sandbox}:/app:ro",
+                "-w", "/app",
+                "python:3.13-slim",
+                "bash", "-c",
+                (
+                    "pip install pytest pytest-timeout --quiet --no-cache-dir "
+                    "2>/dev/null && "
+                    "python -m pytest tests/ -v --tb=short --no-header --timeout=30"
+                )
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180
         )
-        return result.stdout + result.stderr, result.returncode
 
-    def _run_pytest(self, state: PipelineState, sandbox: str) -> PipelineState:
-        if self._docker_available():
-            output, returncode = self._run_in_docker(sandbox)
-        else:
-            output, returncode = self._run_in_subprocess(sandbox)
-
+        output = result.stdout + result.stderr
         state.test_output  = output
-        state.tests_passed = (returncode == 0)
+        state.tests_passed = (result.returncode == 0)
 
         if not state.tests_passed:
             state = self._triage_failure(state, output)
@@ -124,15 +153,18 @@ class ExecutorAgent:
 
     def _triage_failure(self, state: PipelineState,
                         pytest_output: str) -> PipelineState:
+        """Classify failure cause so Orchestrator routes retry to the right agent."""
         try:
-            raw    = chat_json(TRIAGE_PROMPT,
-                               f"Pytest output:\n```\n{pytest_output[:3000]}\n```")
+            raw    = chat_json(
+                TRIAGE_PROMPT,
+                f"Pytest output:\n```\n{pytest_output[:3000]}\n```"
+            )
             triage = json.loads(raw)
-            cause  = triage.get("cause", "patch_wrong")
+            cause  = triage.get("cause",  "patch_wrong")
             reason = triage.get("reason", "")
         except Exception:
             cause  = "patch_wrong"
-            reason = "Triage failed, defaulting to patch retry"
+            reason = "Triage failed -- defaulting to patch retry"
 
         state.failure_cause  = cause
         state.failure_reason = reason
