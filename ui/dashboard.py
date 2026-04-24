@@ -74,6 +74,7 @@ with c1:
 with c2:
     if st.button("Load demo", use_container_width=True):
         st.session_state["use_demo"] = True
+        st.rerun()
 with c3:
     run = st.button("Run pipeline", type="primary", use_container_width=True)
 
@@ -162,12 +163,10 @@ if run and repo_input:
     upd("REPORTER", "Complete", "ok")
     pipeline_ph.markdown(pipeline_html("", done_s), unsafe_allow_html=True)
 
-    # Status bar
     dot = "green" if state.tests_passed else "red"
     msg = "Pipeline completed — all tests passed" if state.tests_passed else ("Pipeline completed with failures — " + state.failure_cause)
     st.markdown('<div class="status-bar"><div class="status-dot ' + dot + '"></div><span>' + msg + '</span></div>', unsafe_allow_html=True)
 
-    # Metrics
     test_count = sum(c.count("def test_") for c in state.test_files.values())
     pass_cls   = "pass" if state.tests_passed else "fail"
     pass_label = "Pass" if state.tests_passed else "Fail"
@@ -179,11 +178,9 @@ if run and repo_input:
         '<div class="metric-card ' + pass_cls + '"><div class="metric-num">' + pass_label + '</div><div class="metric-lbl">Test result</div></div>'
         '</div>', unsafe_allow_html=True)
 
-    # PR link
     if state.pr_url and state.pr_url.startswith("http"):
         st.markdown('<div style="padding:12px 16px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;font-size:13px;color:#15803d;margin-bottom:20px;">Pull request opened &rarr; <a href="' + state.pr_url + '" style="color:#15803d;font-weight:600;">' + state.pr_url + '</a></div>', unsafe_allow_html=True)
 
-    # Bug table
     if state.bug_report:
         st.markdown('<div class="section-title">Bug Report</div>', unsafe_allow_html=True)
         rows = [{"Severity": b.get("severity","").upper(), "File": b.get("file",""), "Line": b.get("line",""), "Issue": b.get("issue","")} for b in state.bug_report]
@@ -192,21 +189,18 @@ if run and repo_input:
                                     "Line": st.column_config.NumberColumn(width="small"),
                                     "File": st.column_config.TextColumn(width="medium")})
 
-    # Patched files
     if state.patched_files:
         st.markdown('<div class="section-title">Patched Files</div>', unsafe_allow_html=True)
         keys = list(state.patched_files.keys())
         for tab, key in zip(st.tabs(keys), keys):
             with tab: st.code(state.patched_files[key], language="python")
 
-    # Generated tests
     if state.test_files:
         st.markdown('<div class="section-title">Generated Tests</div>', unsafe_allow_html=True)
         tkeys = list(state.test_files.keys())
         for tab, key in zip(st.tabs(tkeys), tkeys):
             with tab: st.code(state.test_files[key], language="python")
 
-    # Test output
     if state.test_output:
         st.markdown('<div class="section-title">Test Output</div>', unsafe_allow_html=True)
         with st.expander("Show full pytest output", expanded=not state.tests_passed):
