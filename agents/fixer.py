@@ -4,15 +4,23 @@ fixer.py — Agent 2
 Generates patched versions of buggy files.
 One LLM call per file — all bugs for that file sent together.
 
-CRITICAL: All fixes must use Python stdlib ONLY.
-No bcrypt, no cryptography, no external packages.
-This ensures tests always run in any environment.
+Token budget protection:
+  MAX_BUGS_PER_RUN = 10. On large repos the Scanner may find 100+ issues.
+  Sending all of them to the Fixer burns the entire daily token budget on
+  one call. We take the 10 highest-severity bugs only — enough for a
+  compelling demo without exhausting Groq's free tier.
+
+All fixes use Python stdlib only (no bcrypt, no external packages).
 """
 
 import os
 import json
 from core.llm_client import chat
 from core.orchestrator import PipelineState
+
+MAX_BUGS_PER_RUN = 10   # hard cap — prevents rate-limit exhaustion
+
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 SYSTEM_PROMPT = """You are an expert Python engineer performing a code review fix.
 You will be given:
@@ -31,8 +39,8 @@ CRITICAL — Use ONLY Python standard library. No third-party packages.
     Example:
       import hashlib, os
       salt = os.urandom(16)
-      hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-      return salt.hex() + ':' + hash.hex()
+      hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+      return salt.hex() + ':' + hashed.hex()
   - SQL injection: use parameterised queries with ? placeholders. NEVER f-strings in SQL.
   - Path traversal: use os.path.abspath() + startswith() check.
   - JSON errors: use try/except json.JSONDecodeError.
@@ -48,10 +56,16 @@ class FixerAgent:
 
     def run(self, state: PipelineState) -> PipelineState:
         try:
+            # Sort all bugs by severity, take the worst MAX_BUGS_PER_RUN only
+            all_bugs = [b for b in state.bug_report
+                        if b.get("file") and b["file"] != "test_output"]
+            all_bugs.sort(key=lambda b: SEVERITY_ORDER.get(b.get("severity", "low"), 3))
+            selected_bugs = all_bugs[:MAX_BUGS_PER_RUN]
+
+            # Group selected bugs by file
             bugs_by_file: dict[str, list] = {}
-            for bug in state.bug_report:
-                if bug.get("file") and bug["file"] != "test_output":
-                    bugs_by_file.setdefault(bug["file"], []).append(bug)
+            for bug in selected_bugs:
+                bugs_by_file.setdefault(bug["file"], []).append(bug)
 
             for rel_path, bugs in bugs_by_file.items():
                 abs_path = os.path.join(state.local_path, rel_path)
@@ -60,6 +74,7 @@ class FixerAgent:
                 with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
                     original = f.read()
 
+                # Trim very large files
                 lines = original.splitlines()
                 if len(lines) > 300:
                     original = "\n".join(lines[:300])
