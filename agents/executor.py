@@ -3,21 +3,9 @@ executor.py - Agent 4
 ----------------------
 Runs generated tests in an isolated execution environment.
 
-Execution tiers (in priority order):
-
-  TIER 1 - Docker (full isolation, used on AMD droplet / local):
-    --network none, --memory 512m, --cpus 1, --read-only
-    Sandbox mounted read-only. Throwaway container destroyed after run.
-
-  TIER 2 - Restricted subprocess (cloud fallback, used on Streamlit Cloud):
-    Applied when Docker is unavailable (e.g. Streamlit Community Cloud).
-    Mitigations:
-      - Hard 60s wall-clock timeout (subprocess.run timeout)
-      - Tests run from an isolated temp directory (not the project root)
-      - No network calls possible from test code (no credentials in env)
-      - Uses the host venv Python -- acceptable for a demo environment
-    This tier is intentionally transparent in the UI so users understand
-    the isolation level. For production use, Docker is required.
+Execution tiers:
+  TIER 1 - Docker (full isolation): used when Docker is available
+  TIER 2 - Subprocess (cloud fallback): installs deps first, then runs pytest
 """
 
 import os
@@ -38,11 +26,13 @@ Return ONLY a JSON object with exactly these keys:
   "cause":  one of "patch_wrong" | "test_wrong" | "environment"
   "reason": one sentence explaining why
 
-  "patch_wrong"   = the fixed code has a bug
-  "test_wrong"    = the test itself is broken
-  "environment"   = missing import, setup error unrelated to logic
+  "patch_wrong"   = the fixed code has a bug (assertions fail on correct logic)
+  "test_wrong"    = the test itself is broken (wrong import path, bad assertion)
+  "environment"   = missing import, package not installed, setup error
 
 No markdown, no extra text -- raw JSON only."""
+
+SANDBOX_PACKAGES = ["pytest", "pytest-timeout"]
 
 
 class ExecutorAgent:
@@ -58,10 +48,10 @@ class ExecutorAgent:
         try:
             sandbox = self._build_sandbox(state)
             if self._docker_available():
+                state.sandbox_mode = "docker"
                 state = self._run_in_docker(state, sandbox)
             else:
-                # Cloud fallback - transparent to the user via the UI log
-                state.sandbox_mode = "subprocess (Docker unavailable)"
+                state.sandbox_mode = "subprocess"
                 state = self._run_in_subprocess(state, sandbox)
         except Exception as e:
             state.error = f"ExecutorAgent error: {e}"
@@ -90,9 +80,20 @@ class ExecutorAgent:
 
         return sandbox
 
+    def _install_sandbox_deps(self, sandbox: str):
+        """Install pytest + any requirements.txt in sandbox before running tests."""
+        subprocess.run(
+            [PYTHON_BIN, "-m", "pip", "install"] + SANDBOX_PACKAGES + ["--quiet", "--no-cache-dir"],
+            capture_output=True, timeout=60
+        )
+        req_file = os.path.join(sandbox, "requirements.txt")
+        if os.path.exists(req_file):
+            subprocess.run(
+                [PYTHON_BIN, "-m", "pip", "install", "-r", req_file, "--quiet", "--no-cache-dir"],
+                capture_output=True, timeout=120
+            )
+
     def _run_in_docker(self, state: PipelineState, sandbox: str) -> PipelineState:
-        """Tier 1 -- full Docker isolation."""
-        state.sandbox_mode = "docker"
         result = subprocess.run(
             [
                 "docker", "run", "--rm",
@@ -114,7 +115,8 @@ class ExecutorAgent:
         return self._process_result(state, result.stdout + result.stderr, result.returncode)
 
     def _run_in_subprocess(self, state: PipelineState, sandbox: str) -> PipelineState:
-        """Tier 2 -- restricted subprocess (cloud demo mode)."""
+        """Install dependencies first, then run pytest."""
+        self._install_sandbox_deps(sandbox)
         result = subprocess.run(
             [PYTHON_BIN, "-m", "pytest", "tests/", "-v",
              "--tb=short", "--no-header", "--timeout=30"],
