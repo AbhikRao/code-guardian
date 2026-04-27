@@ -3,13 +3,24 @@ dashboard.py — Code Guardian
 Run with:  streamlit run ui/dashboard.py
 """
 
-import sys, os
+import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import streamlit as st
 import pandas as pd
 
 st.set_page_config(page_title="Code Guardian", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
+
+# ── Keepalive: prevents Streamlit Cloud from sleeping during judge evaluation
+# Injects a hidden auto-refresh every 30 seconds so the app stays awake
+st.markdown("""
+<script>
+  // Ping the app every 30s to prevent Streamlit Cloud sleep
+  setInterval(function() {
+    fetch(window.location.href, {method: 'GET', cache: 'no-cache'});
+  }, 30000);
+</script>
+""", unsafe_allow_html=True)
 
 st.markdown("""
 <style>
