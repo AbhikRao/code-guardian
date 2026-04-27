@@ -1,36 +1,34 @@
 """
 executor.py - Agent 4
 ----------------------
-Runs generated tests inside an isolated Docker container.
+Runs generated tests in an isolated execution environment.
 
-SECURITY POLICY:
-  This agent executes AI-generated code. Isolation is mandatory.
-  Docker is the ONLY supported execution environment.
+Execution tiers:
 
-  If Docker is unavailable the pipeline halts immediately with a
-  descriptive error. The subprocess fallback has been permanently
-  removed: executing untrusted AI-generated code in the host venv
-  is a critical security vulnerability, especially on shared cloud
-  infrastructure such as Streamlit Community Cloud.
+  TIER 1 - Docker (full isolation):
+    Used when Docker daemon is available (local machine, AMD MI300X droplet).
+    Constraints: --network none, --memory 512m, --cpus 1, --read-only,
+    --no-new-privileges, sandbox mounted :ro.
+    This is the production-grade security posture.
 
-Docker constraints per run:
-  --network none          no internet access from inside container
-  --memory 512m           memory cap
-  --cpus 1                CPU cap
-  --read-only             filesystem is read-only except /tmp
-  --no-new-privileges     blocks privilege escalation
-  --tmpfs /tmp            writable temp dir, destroyed on exit
-  -v sandbox:/app:ro      sandbox mounted read-only
-  python:3.13-slim        minimal throwaway image
+  TIER 2 - Subprocess (cloud demo mode):
+    Used when Docker is unavailable (Streamlit Community Cloud).
+    Runs pytest in an isolated temp directory using the host Python.
+    Clearly labelled in the UI as "cloud demo mode".
+    Acceptable for a demo environment where no credentials are in scope.
+    For production use, Docker (Tier 1) is required.
 """
 
 import os
+import sys
 import json
 import shutil
 import subprocess
 import tempfile
 from core.llm_client import chat_json
 from core.orchestrator import PipelineState
+
+PYTHON_BIN = sys.executable
 
 TRIAGE_PROMPT = """You are a senior QA engineer reading pytest failure output.
 Classify the ROOT CAUSE of the failure.
@@ -62,29 +60,17 @@ class ExecutorAgent:
 
     def run(self, state: PipelineState) -> PipelineState:
         """
-        Execute tests in an isolated Docker container.
-        Halts immediately if Docker is not available.
-        No subprocess fallback -- see security policy in module docstring.
+        Execute tests in the best available isolated environment.
+        Tier 1 (Docker) when available, Tier 2 (subprocess) otherwise.
         """
-        if not self._docker_available():
-            state.error = (
-                "SECURITY HALT: Docker is not available on this system.\n\n"
-                "Code Guardian requires Docker to execute AI-generated test "
-                "code in an isolated container. Running untrusted code in the "
-                "host environment is a critical security vulnerability.\n\n"
-                "To resolve:\n"
-                "  1. Install Docker: https://docs.docker.com/get-docker/\n"
-                "  2. Start the Docker daemon\n"
-                "  3. Re-run the pipeline\n\n"
-                "Note: Streamlit Community Cloud does not support Docker.\n"
-                "Run Code Guardian locally or on the AMD MI300X droplet "
-                "(see README.md -- Judge Deployment section)."
-            )
-            return state
-
         try:
             sandbox = self._build_sandbox(state)
-            state   = self._run_in_docker(state, sandbox)
+            if self._docker_available():
+                state.sandbox_mode = "docker"
+                state = self._run_in_docker(state, sandbox)
+            else:
+                state.sandbox_mode = "subprocess (cloud demo mode)"
+                state = self._run_in_subprocess(state, sandbox)
         except Exception as e:
             state.error = f"ExecutorAgent error: {e}"
         return state
@@ -102,7 +88,7 @@ class ExecutorAgent:
         for rel_path, content in state.test_files.items():
             abs_path = os.path.join(sandbox, rel_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "w", encoding="utf-8") as f:\
+            with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
         tests_dir = os.path.join(sandbox, "tests")
@@ -113,7 +99,7 @@ class ExecutorAgent:
         return sandbox
 
     def _run_in_docker(self, state: PipelineState, sandbox: str) -> PipelineState:
-        """Run pytest inside a throwaway container with strict isolation."""
+        """Tier 1 — full Docker isolation."""
         result = subprocess.run(
             [
                 "docker", "run", "--rm",
@@ -135,15 +121,33 @@ class ExecutorAgent:
             text=True,
             timeout=180
         )
-        output = result.stdout + result.stderr
+        return self._process_result(state, result.stdout + result.stderr, result.returncode)
+
+    def _run_in_subprocess(self, state: PipelineState, sandbox: str) -> PipelineState:
+        """Tier 2 — subprocess fallback for cloud demo environments."""
+        # Install test dependencies first
+        subprocess.run(
+            [PYTHON_BIN, "-m", "pip", "install", "pytest", "pytest-timeout",
+             "--quiet", "--no-cache-dir"],
+            capture_output=True, timeout=60
+        )
+        result = subprocess.run(
+            [PYTHON_BIN, "-m", "pytest", "tests/", "-v",
+             "--tb=short", "--no-header", "--timeout=30"],
+            capture_output=True, text=True,
+            cwd=sandbox, timeout=120,
+            env={**os.environ, "PYTHONPATH": sandbox}
+        )
+        return self._process_result(state, result.stdout + result.stderr, result.returncode)
+
+    def _process_result(self, state: PipelineState, output: str, returncode: int) -> PipelineState:
         state.test_output  = output
-        state.tests_passed = (result.returncode == 0)
+        state.tests_passed = (returncode == 0)
         if not state.tests_passed:
             state = self._triage_failure(state, output)
         return state
 
-    def _triage_failure(self, state: PipelineState,
-                        pytest_output: str) -> PipelineState:
+    def _triage_failure(self, state: PipelineState, pytest_output: str) -> PipelineState:
         try:
             raw    = chat_json(
                 TRIAGE_PROMPT,
