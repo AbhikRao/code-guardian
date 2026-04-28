@@ -3,13 +3,12 @@ scanner.py — Agent 1
 ─────────────────────
 Two-phase scan:
   Phase 1: pyflakes static analysis (fast, free, no tokens)
-  Phase 2: LLM deep scan on files flagged by pyflakes or risk keywords
+  Phase 2: LLM deep scan on top-risk files only
 
-Supported file types: .py, .ipynb (Jupyter notebooks extracted to Python)
-
-Large repo protection:
-  Caps at MAX_FILES_PER_RUN to avoid burning daily token budgets.
-  Files are prioritised by risk-keyword density.
+Token budget:
+  MAX_FILES_PER_RUN = 6  (each file ~6k tokens, 6 files = ~36k tokens)
+  MAX_LINES_PER_FILE = 150  (trims large files before sending to LLM)
+  This leaves ~60k tokens for the Fixer + TestWriter on Groq's 100k daily limit.
 
 Cloning strategy:
   - Local path: read files directly from disk
@@ -23,7 +22,8 @@ import subprocess
 from core.llm_client import chat_json
 from core.orchestrator import PipelineState
 
-MAX_FILES_PER_RUN = 15   # prevent token exhaustion on huge repos
+MAX_FILES_PER_RUN  = 6    # hard cap — keeps scanner under ~36k tokens
+MAX_LINES_PER_FILE = 150  # trim large files before LLM call
 
 RISK_KEYWORDS = [
     "execute(", "eval(", "exec(", "subprocess", "pickle",
@@ -55,8 +55,6 @@ class ScannerAgent:
             state.error = f"ScannerAgent error: {e}"
         return state
 
-    # ── Path resolution ───────────────────────────────────────────────────────
-
     def _resolve_path(self, state: PipelineState) -> PipelineState:
         if state.local_path and os.path.isdir(state.local_path):
             return state
@@ -83,7 +81,7 @@ class ScannerAgent:
         return state
 
     def _fetch_dir(self, repo, path, local_root, depth=0):
-        if depth > 4:   # don't recurse forever
+        if depth > 4:
             return
         skip = {".git", "__pycache__", "venv", ".venv", "node_modules",
                 "dist", "build", ".tox", "migrations"}
@@ -116,8 +114,6 @@ class ScannerAgent:
                 pass
         return val
 
-    # ── File collection ───────────────────────────────────────────────────────
-
     def _collect_files(self, root: str) -> list:
         skip_dirs = {".git", "__pycache__", ".venv", "venv",
                      "node_modules", "dist", "build", "migrations"}
@@ -130,7 +126,6 @@ class ScannerAgent:
         return result
 
     def _extract_source(self, filepath: str) -> str:
-        """Extract Python source — handle both .py and .ipynb."""
         if filepath.endswith(".ipynb"):
             try:
                 nb = json.loads(open(filepath, encoding="utf-8", errors="ignore").read())
@@ -138,16 +133,11 @@ class ScannerAgent:
                 for cell in nb.get("cells", []):
                     if cell.get("cell_type") == "code":
                         src = cell.get("source", [])
-                        if isinstance(src, list):
-                            lines.extend(src)
-                        else:
-                            lines.append(src)
+                        lines.extend(src if isinstance(src, list) else [src])
                 return "".join(lines)
             except Exception:
                 return ""
         return open(filepath, "r", encoding="utf-8", errors="ignore").read()
-
-    # ── Risk scoring ──────────────────────────────────────────────────────────
 
     def _risk_score(self, source: str) -> int:
         src_lower = source.lower()
@@ -155,18 +145,15 @@ class ScannerAgent:
 
     def _pyflakes_has_issues(self, filepath: str) -> bool:
         if filepath.endswith(".ipynb"):
-            return True   # always deep-scan notebooks
+            return True
         result = subprocess.run(
             ["python3", "-m", "pyflakes", filepath],
             capture_output=True, text=True
         )
         return bool(result.stdout.strip() or result.returncode != 0)
 
-    # ── Main scan ─────────────────────────────────────────────────────────────
-
     def _scan_files(self, state: PipelineState) -> PipelineState:
         all_files = self._collect_files(state.local_path)
-
         if not all_files:
             state.error = "No Python files found in repository."
             return state
@@ -181,7 +168,6 @@ class ScannerAgent:
             if score > 0 or self._pyflakes_has_issues(filepath):
                 scored.append((score, filepath, source))
 
-        # Sort descending by risk, cap to limit
         scored.sort(key=lambda x: x[0], reverse=True)
         to_scan = scored[:MAX_FILES_PER_RUN]
 
@@ -189,10 +175,9 @@ class ScannerAgent:
         for _, filepath, source in to_scan:
             rel_path = os.path.relpath(filepath, state.local_path)
             try:
-                # Trim very large files
                 lines = source.splitlines()
-                if len(lines) > 250:
-                    source = "\n".join(lines[:250])
+                if len(lines) > MAX_LINES_PER_FILE:
+                    source = "\n".join(lines[:MAX_LINES_PER_FILE])
 
                 user_prompt = f"File: {rel_path}\n\n```python\n{source}\n```"
                 raw  = chat_json(SYSTEM_PROMPT, user_prompt)

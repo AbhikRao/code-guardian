@@ -3,7 +3,7 @@ dashboard.py — Code Guardian
 Run with:  streamlit run ui/dashboard.py
 """
 
-import sys, os, time
+import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import streamlit as st
@@ -11,11 +11,9 @@ import pandas as pd
 
 st.set_page_config(page_title="Code Guardian", page_icon=None, layout="wide", initial_sidebar_state="collapsed")
 
-# ── Keepalive: prevents Streamlit Cloud from sleeping during judge evaluation
-# Injects a hidden auto-refresh every 30 seconds so the app stays awake
+# Keepalive: prevents Streamlit Cloud from sleeping during judge evaluation
 st.markdown("""
 <script>
-  // Ping the app every 30s to prevent Streamlit Cloud sleep
   setInterval(function() {
     fetch(window.location.href, {method: 'GET', cache: 'no-cache'});
   }, 30000);
@@ -66,6 +64,7 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .status-bar { display:flex; align-items:center; gap:8px; padding:10px 16px; background:#fafafa; border:1px solid #e4e4e7; border-radius:6px; font-size:13px; color:#374151; margin-bottom:16px; }
 .status-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
 .status-dot.green { background:#16a34a; } .status-dot.red { background:#dc2626; }
+.demo-hint { font-size:12px; color:#9ca3af; margin-top:8px; font-family:'JetBrains Mono',monospace; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -92,8 +91,12 @@ with c3:
 if st.session_state.get("use_demo"):
     repo_input = "https://github.com/AbhikRao/code-guardian-demo"
 
+st.markdown('<p class="demo-hint">⚠️ For best results use the demo repo or small repos (&lt;50 files). Large repos may hit the daily token limit.</p>', unsafe_allow_html=True)
+
 # ── Pipeline track
 STEPS = ["SCANNER", "FIXER", "TEST WRITER", "EXECUTOR", "REPORTER"]
+
+MAX_BUGS_FIXED = 10  # must match agents/fixer.py
 
 def pipeline_html(active, done_set):
     parts = []
@@ -147,7 +150,8 @@ if run and repo_input:
     done_s.add("SCANNER")
     upd("SCANNER", "Found " + str(len(state.bug_report)) + " issue(s)")
 
-    upd("FIXER", "Generating patches for " + str(len(state.bug_report)) + " bug(s)...")
+    bugs_to_fix = min(len(state.bug_report), MAX_BUGS_FIXED)
+    upd("FIXER", "Patching top " + str(bugs_to_fix) + " bug(s) by severity...")
     state = FixerAgent().run(state)
     if state.error: st.error(state.error); st.stop()
     done_s.add("FIXER")
@@ -216,9 +220,6 @@ if run and repo_input:
         st.markdown('<div class="section-title">Test Output</div>', unsafe_allow_html=True)
         with st.expander("Show full pytest output", expanded=not state.tests_passed):
             st.code(state.test_output, language="text")
-
-    if state.retry_count > 1:
-        st.markdown('<div style="padding:10px 14px;background:#fefce8;border:1px solid #fde68a;border-radius:6px;font-size:12px;color:#92400e;font-family:JetBrains Mono,monospace;margin-top:16px;">Pipeline retried ' + str(state.retry_count - 1) + 'x — last failure routed to ' + state.failure_cause + ' handler</div>', unsafe_allow_html=True)
 
 # ── Footer
 st.markdown('<div style="margin-top:60px;padding-top:20px;border-top:1px solid #f0f0f0;display:flex;justify-content:space-between;"><span style="font-size:12px;color:#9ca3af;font-family:JetBrains Mono,monospace;">Code Guardian</span><span style="font-size:12px;color:#d1d5db;">AMD Developer Hackathon 2026</span></div>', unsafe_allow_html=True)
